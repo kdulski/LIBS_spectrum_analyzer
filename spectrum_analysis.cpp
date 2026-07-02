@@ -8,6 +8,7 @@
 #include "THStack.h"
 #include <TMath.h>
 #include "TF1.h"
+
 using namespace std;
 
 Double_t start_ch1 = 182.56;
@@ -23,6 +24,9 @@ Double_t stop_ch5 = 721.85;
 Double_t start_ch6 = 721.86;
 Double_t stop_ch6 = 909.27;
 
+int minLength_ch[6] = {4, 4, 4, 6, 4, 4}; // ile binów musi być spadek w każdym z kanałów
+int halfLengthToCheckExtremum_ch[6] = {5, 5, 5, 5, 3, 3}; // ile punktow obok musi byc mniejsze od maxa
+
 TH1F* Prepare_spectrum(vector<double> arguments, vector<double> values, double start, double stop, int ch);
 double GramPolynomial(int i, int m, int k, int s);
 double GenFactor(int a, int b);
@@ -32,6 +36,7 @@ TGraph* FindDecreasingSeries(TH1F* derivative_hist, int minLength, double halfLe
 double VoigtForPeak(double x, double mean, double sigma, double gamma);
 double VoigtToDraw(Double_t *A, Double_t *P);
 double StandardDeviation(TGraph* spectrum_ch);
+void EstimateBackground(vector<double> arguments_ch, vector<double> values_ch);
 
 vector<double> peakWavelenght; // globalny wektor na dł. fali peaków
 vector<double> peakWidth; // globalny wektor na szerokości peaków
@@ -39,102 +44,90 @@ vector<double> peakHeight;
 // double InitialNoiseRangeNm = 190; // będzie liczył odchylenie standardowe z zakresu x od początku do x=InitialNoiseRange, tu jest dł. fali
 
 Int_t spectrum_analysis (const string data_file) {
+// deklaracja obiektu typu fstream
+    fstream file;
+// otwarcie pliku w trybie ios::in czyli do odczytu
+    file.open(data_file, ios::in);
 
-    int minLength_ch[6] = {4, 4, 4, 6, 4, 4}; // ile binów musi być spadek w każdym z kanałów
-    int halfLengthToCheckExtremum_ch[6] = {5, 5, 5, 5, 3, 3}; // ile punktow obok musi byc mniejsze od maxa
-
-    fstream plik; // deklaracja objektu plik typu fstream
-    plik.open(data_file, ios::in); // otwarcie pliku w trybie ios::in czyli do odczytu
-
-    if(!plik.is_open()){
-        cout << "Blad przy otwieraniu pliku." << endl;
+    if(!file.is_open()){
+        cout << "Error while opening file: " << data_file << endl;
         return 1;
     } else {
-        cout << "Poprawnie otwarto plik." << endl;
+        cout << "File: " << data_file << " opened" << endl;
     }
 
-    string linia;
+    string line;
     string tempArg, tempValue;
-    vector<double> arguments, values; // tworzy 2 wektory domyślnie puste 
+// tworzy 2 wektory domyślnie puste
+    vector<double> arguments, values;
 
-    getline(plik, linia); // wczytuje wiersz z "plik" i zapisuje go jako "linia"
-    while (plik >> tempArg >> tempValue) { // pierwsza wartosc z wiersza jest zapisywana jako tempArg a druga jako tempValue
-        arguments.push_back(stod(tempArg)); // dodaje wartosc z stod(tempArg) na koniec wektora arguments
+// wczytuje wiersz z "file" i zapisuje go jako "line"
+    getline(file, line);
+// założenie że mamy dwie liczby na wiersz gdzie pierwsza wartosc z wiersza jest zapisywana jako tempArg a druga jako tempValue
+// jeśli w pliiku jest jakiś nagłówek trzeba ominąć te linie żeby ominąc występowanie błędu
+    while (file >> tempArg >> tempValue) {
+// dodaje wartosc z stod(tempArg) na koniec wektora arguments
+        arguments.push_back(stod(tempArg));
         values.push_back(stod(tempValue));
     }
 
-    double start_ch[6] = {start_ch1, start_ch2, start_ch3, start_ch4, start_ch5, start_ch6}; 
-    double stop_ch[6] = {stop_ch1, stop_ch2, stop_ch3, stop_ch4, stop_ch5, stop_ch6};
+    vector<pair<double,double>> limits_ch;
+    limits_ch.push_back(make_pair(start_ch1, stop_ch1));
+    limits_ch.push_back(make_pair(start_ch2, stop_ch2));
+    limits_ch.push_back(make_pair(start_ch3, stop_ch3));
+    limits_ch.push_back(make_pair(start_ch4, stop_ch4));
+    limits_ch.push_back(make_pair(start_ch5, stop_ch5));
+    limits_ch.push_back(make_pair(start_ch6, stop_ch6));
 
-    double binSize = arguments.at(1) - arguments.at(0); // x dla 1 argumentu - x dla 0 argumentu to szerokość binu, zakładam, że jest taka sama dla wszystkich kanałów
-    /* int nbins = int((arguments.at(arguments.size() - 1) - arguments.at(0)) / binSize) + 1; // liczy ilość binów dla całego spektrum */
-
-    cout << binSize << endl;
-
-    // TH1F* spectrum[6];
     TGraph *spectrum[6];
     TCanvas* c1[6];
 
     double sigma[6];
     double minimumHeightDifference_ch[6];
-    vector<double> arguments_ch, values_ch; // wektory na argumenty dla kanału w którym jesteśmy
+// wektory na argumenty i wartości dla kanału w którym jesteśmy
+    vector<double> arguments_ch, values_ch;
 
-    for(Int_t i = 0; i < 6; i++){
+    double noOfSigmaForConfInterval = 1;
 
-        // int nbins = int((stop_ch[i] - start_ch[i]) / binSize) + 1; // ta wartość się ustawia na nowo w każdej pętli
-
+    for (Int_t i=0; i<6; i++) {
         arguments_ch.clear();
         values_ch.clear();
 
-        for (Int_t j = 0; j < arguments.size(); j++) { // dla kolejnych argumentów (wszystkich)
-            if (arguments[j] >= start_ch[i] && arguments[j] <= stop_ch[i]) {    // jeżeli argument należy do kanału w którym jesteśmy
+        for (Int_t j=0; j<arguments.size(); j++) { // dla kolejnych argumentów (wszystkich)
+            if (arguments[j] >= limits_ch.at(i).first && arguments[j] <= limits_ch.at(i).second) {
+// jeżeli argument należy do kanału w którym jesteśmy
                 arguments_ch.push_back(arguments[j]);
                 values_ch.push_back(values[j]);
             }
         }
 
-        // spectrum[i] = new TH1F(Form("Spectrum channel %d", i + 1), Form("Spectrum channel %d", i + 1), nbins, start_ch[i], stop_ch[i]); // (liczba binow - przedzialow, dolna krawedz pierwszego binu, gorna krawedz ostatniego binu)
+// spectrum[i] = new TH1F(Form("Spectrum channel %d", i + 1), Form("Spectrum channel %d", i + 1), nbins, start_ch[i], stop_ch[i]); // (liczba binow - przedzialow, dolna krawedz pierwszego binu, gorna krawedz ostatniego binu)
         spectrum[i]= new TGraph(arguments_ch.size(), arguments_ch.data(), values_ch.data());
 
-        /*for(Int_t j=0; j<arguments.size(); j++){ // wypelnianie histogramu
-            if (arguments[j] >= start_ch[i] && arguments[j] <= stop_ch[i]) { 
-            int bin = spectrum[i]->FindBin(arguments[j]); // znajduje bin (przedial) z histogramu "spectrum" w ktorym jest "argument"
-            spectrum[i]->SetBinContent(bin, values[j]); // wpisuje jako wartosc binu "values"
-            }
-        }
-        */
-
-        c1[i] = new TCanvas(Form("c1 ch%d", i + 1), Form("c1 ch%d", i + 1), 800, 600); // (tytul w root, tytuł w oknie, szerokość w pikselach, wysokość w pikselach)
+// (tytul w root, tytuł w oknie, szerokość w pikselach, wysokość w pikselach)
+        c1[i] = new TCanvas(Form("c1 ch%d", i + 1), Form("c1 ch%d", i + 1), 800, 600);
 
         spectrum[i]->SetLineColor(kBlue+3);
         spectrum[i]->SetLineWidth(2);
-        gStyle->SetOptStat(111111); // SetOptStat okresla jakie informacje  maja sie wyswietlic na wykresie
+// SetOptStat okresla jakie informacje  maja sie wyswietlic na wykresie
+        gStyle->SetOptStat(111111);
 
         // spectrum[i]->Draw("HIST"); // rysuj słupki
         spectrum[i]->Draw("AL"); // A - axes, L -lines
 
-        int emptyBins = 0;
-
-        for (int b = 1; b <= spectrum[i]->GetN(); ++b) {
-            if (spectrum[i]->GetY()[b] == 0)
-                emptyBins++;
-        }
-
         sigma[i] = StandardDeviation(spectrum[i]);
+        EstimateBackground(arguments_ch, values_ch);
         cout << "sigma ch " << i+1 << " = " << sigma[i] << endl;
 
-        minimumHeightDifference_ch[i] = 1 * sigma[i];// różnica w wysokości max i min pochodnej
+        minimumHeightDifference_ch[i] = noOfSigmaForConfInterval * sigma[i]; // różnica w wysokości max i min pochodnej
     }
 
     TH1F* derivative[6];
     TGraph* peaks[6];
     THStack* stack = new THStack("stack", "Smoothed derivatives; wavelength [nm]; counts [a.u.]");
 
-    for(Int_t i = 0; i < 6; i++) {
-
-        derivative[i] = Prepare_spectrum(arguments, values, start_ch[i], stop_ch[i], i+1); // wywolanie funkcji
-
-        // derivative[i]->SetName(Form("derivative_hist_%d", i + 1)); // nazwa w roocie, to już jest robione w Prepare_spectrum
+    for (Int_t i=0; i<6; i++) {
+        derivative[i] = Prepare_spectrum(arguments, values, limits_ch.at(i).first, limits_ch.at(i).second, i+1); // wywolanie funkcji
         derivative[i]->SetTitle(Form("Smoothed devivative - channel no. %d", i + 1)); // tytuł w oknie wykresu
         derivative[i]->SetLineColor(kRed+3);
         derivative[i]->SetLineWidth(4);
@@ -150,12 +143,10 @@ Int_t spectrum_analysis (const string data_file) {
         peaks[i]->SetMarkerColor(kRed);
         peaks[i]->SetMarkerSize(0.5);
 
-        // rysowanie peaków na spektrum
+// rysowanie peaków na spektrum
         c1[i]->cd();
         peaks[i]->Draw("P SAME");
     }
-
-    // koniec petli
 
     TCanvas *c2 = new TCanvas("c2", "Smoothed Derivative", 800, 600);
 
@@ -163,10 +154,6 @@ Int_t spectrum_analysis (const string data_file) {
 
     stack->SetMinimum(-40000); // ustawienie zakresu osi y
     stack->SetMaximum(40000);
-
-    /*for (int i = 0; i < 6; i++) {
-        peaks[i]->Draw("P SAME");  // rysujemy punkty w peakach, P - points, SAME - na tym samym canvasie co wcześniej, czyli smoothed dirivative
-    }*/
 
     TCanvas *c3 = new TCanvas("c3", "Peak Widths", 800, 600); 
 
@@ -192,8 +179,8 @@ Int_t spectrum_analysis (const string data_file) {
         c1[j]->cd();
         for (Int_t i = 0; i < peakWavelenght.size(); i++) { // pętla po peakach
 
-            if (peakWavelenght[i] >= start_ch[j] &&
-            peakWavelenght[i] <= stop_ch[j]) {
+            if (peakWavelenght[i] >= limits_ch.at(j).first &&
+            peakWavelenght[i] <= limits_ch.at(j).second) {
 
                 TF1 *voigtFit = new TF1(Form("voigtFit_ch%d_peak%d", j + 1, i), VoigtToDraw, peakWavelenght[i] - peakWidth[i], peakWavelenght[i] + peakWidth[i], 6); // (nazwa, wzór, odkąd, dokąd, ile parametrów)
 
@@ -205,15 +192,13 @@ Int_t spectrum_analysis (const string data_file) {
                 1,
                 1
                 );
-        // dodać sprawdzenie które spektrum - element w tablicy/wektorze; na podstawie start i stop ch
-        // for int j=0 do 6
-        //    if (peakWavelenght[i] > startCh[j] && peakWavelenght[i] < stop_ch[j])
+// dodać sprawdzenie które spektrum - element w tablicy/wektorze; na podstawie start i stop ch
+// for int j=0 do 6
+//    if (peakWavelenght[i] > startCh[j] && peakWavelenght[i] < stop_ch[j])
                 spectrum[j]->Fit(voigtFit,"RM+"); // R - fituj w ustalonym regionie, + - nie usuwaj poprzednich fitów
                 voigtFit->Draw("SAME");
-                
             }
         }
-        
     }
     
     return 0;
@@ -463,4 +448,58 @@ double StandardDeviation(TGraph* spectrum_ch)
     return SmallestSigma;
 }
 
-
+void EstimateBackground(vector<double> arguments_ch, vector<double> values_ch)
+{
+// Looking for local minima
+  vector<int> minIndex;
+  int minBinHalfRangeForMin = 5;
+  cout << "Arguments for min: ";
+  for (int i=minBinHalfRangeForMin; i<arguments_ch.size()-minBinHalfRangeForMin; i++) {
+    bool possibleMin = true;
+    for (int j=1; j<=minBinHalfRangeForMin; j++) {
+      if (values_ch.at(i) > values_ch.at(i-j) || values_ch.at(i) > values_ch.at(i+j))
+        possibleMin = false;
+    }
+    if (possibleMin) {
+      minIndex.push_back(i);
+      cout << arguments_ch.at(i) << " ";
+    }
+  }
+  cout << endl;
+//
+// Looking for standard deviation around the local minima
+  vector<double> sdAroundMin;
+  cout << "SD for min: ";
+  for (int i=0; i<minIndex.size(); i++) {
+    double mean = 0;
+    for (int j=-minBinHalfRangeForMin; j<=minBinHalfRangeForMin; j++) {
+      mean += values_ch.at(minIndex.at(i)+j)/(2*minBinHalfRangeForMin+1);
+    }
+    double sd = 0;
+    for (int j=-minBinHalfRangeForMin; j<=minBinHalfRangeForMin; j++) {
+      sd += std::pow(values_ch.at(minIndex.at(i)+j) - mean, 2)/(2*minBinHalfRangeForMin+1)/(2*minBinHalfRangeForMin);
+    }
+    sdAroundMin.push_back(sqrt(sd));
+    cout << sqrt(sd) << " ";
+  }
+  cout << endl;
+//
+// Getting rid of sd too high and calculating mean SD
+  vector<double> copyForMedian = sdAroundMin;
+  sort(copyForMedian.begin(), copyForMedian.end());
+  double median = copyForMedian.at((int)(0.5*copyForMedian.size()));
+  double ceilingForSD = 2*median;
+  double meanSD = 0;
+  int noOfNumberToMean = 0;
+  vector<double> minIndexCropped;
+  for (unsigned i=0; i<sdAroundMin.size(); i++) {
+    if (sdAroundMin.at(i) < ceilingForSD) {
+      meanSD += sdAroundMin.at(i);
+      noOfNumberToMean++;
+      minIndexCropped.push_back(minIndex.at(i));
+    }
+  }
+  meanSD /= noOfNumberToMean;
+  cout << "Median and meanSD: " << median << " " << meanSD << endl;
+//
+}
