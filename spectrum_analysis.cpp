@@ -6,8 +6,9 @@
 #include "TCanvas.h"
 #include "TGraph.h"
 #include "THStack.h"
-#include <TMath.h>
+#include "TMath.h"
 #include "TF1.h"
+#include "TFile.h"
 
 using namespace std;
 
@@ -24,6 +25,8 @@ Double_t stop_ch5 = 721.85;
 Double_t start_ch6 = 721.86;
 Double_t stop_ch6 = 909.27;
 
+double tempMeanSD = 1;
+
 int minLength_ch[6] = {4, 4, 4, 6, 4, 4}; // ile binów musi być spadek w każdym z kanałów
 int halfLengthToCheckExtremum_ch[6] = {5, 5, 5, 5, 3, 3}; // ile punktow obok musi byc mniejsze od maxa
 
@@ -36,14 +39,25 @@ TGraph* FindDecreasingSeries(TH1F* derivative_hist, int minLength, double halfLe
 double VoigtForPeak(double x, double mean, double sigma, double gamma);
 double VoigtToDraw(Double_t *A, Double_t *P);
 double StandardDeviation(TGraph* spectrum_ch);
-void EstimateBackground(vector<double> arguments_ch, vector<double> values_ch);
+TGraph* EstimateBackground(vector<double> arguments_ch, vector<double> values_ch);
+TGraph* FindPeaks(vector<double> arguments_ch, vector<double> values_ch, TF1* bgFit);
+Double_t peakFunc(Double_t *A, Double_t *P);
 
 vector<double> peakWavelenght; // globalny wektor na dł. fali peaków
 vector<double> peakWidth; // globalny wektor na szerokości peaków
 vector<double> peakHeight;
 // double InitialNoiseRangeNm = 190; // będzie liczył odchylenie standardowe z zakresu x od początku do x=InitialNoiseRange, tu jest dł. fali
 
-Int_t spectrum_analysis (const string data_file) {
+int main (int argc, char* argv[]) {
+  string data_file;
+  if (argc < 2) {
+    cout << "No arguments given. Turning on interactive input mode." << endl;
+    cout << "Give me the name of the file to analyze" << endl;
+    cin >> data_file;
+  } else {
+    data_file = argv[1];
+  }
+
 // deklaracja obiektu typu fstream
     fstream file;
 // otwarcie pliku w trybie ios::in czyli do odczytu
@@ -89,6 +103,19 @@ Int_t spectrum_analysis (const string data_file) {
 
     double noOfSigmaForConfInterval = 1;
 
+    TString slash = "/";
+    TString dot = ".";
+    std::size_t slashPlace = data_file.rfind(slash);
+    std::size_t dotPlace = data_file.rfind(dot);
+    std::string filenameCleaned = data_file;
+    if (slashPlace > 0 && dotPlace > slashPlace) {
+      filenameCleaned = data_file.substr(slashPlace+1, dotPlace);
+    } else if (dotPlace > 0) {
+      filenameCleaned = data_file.substr(0, dotPlace);
+    }
+    TString outputName = "LIBSFit_" + filenameCleaned + ".root";
+    TFile* outputFile = new TFile(outputName, "RECREATE");
+
     for (Int_t i=0; i<6; i++) {
         arguments_ch.clear();
         values_ch.clear();
@@ -102,25 +129,66 @@ Int_t spectrum_analysis (const string data_file) {
         }
 
 // spectrum[i] = new TH1F(Form("Spectrum channel %d", i + 1), Form("Spectrum channel %d", i + 1), nbins, start_ch[i], stop_ch[i]); // (liczba binow - przedzialow, dolna krawedz pierwszego binu, gorna krawedz ostatniego binu)
-        spectrum[i]= new TGraph(arguments_ch.size(), arguments_ch.data(), values_ch.data());
+        TGraph *spectrum = new TGraph(arguments_ch.size(), arguments_ch.data(), values_ch.data());
+        spectrum->Write("rawSpectrum");
 
 // (tytul w root, tytuł w oknie, szerokość w pikselach, wysokość w pikselach)
-        c1[i] = new TCanvas(Form("c1 ch%d", i + 1), Form("c1 ch%d", i + 1), 800, 600);
+//        c1[i] = new TCanvas(Form("c1 ch%d", i + 1), Form("c1 ch%d", i + 1), 800, 600);
 
-        spectrum[i]->SetLineColor(kBlue+3);
-        spectrum[i]->SetLineWidth(2);
+//        spectrum[i]->SetLineColor(kBlue+3);
+//        spectrum[i]->SetLineWidth(2);
 // SetOptStat okresla jakie informacje  maja sie wyswietlic na wykresie
-        gStyle->SetOptStat(111111);
+//        gStyle->SetOptStat(111111);
 
         // spectrum[i]->Draw("HIST"); // rysuj słupki
-        spectrum[i]->Draw("AL"); // A - axes, L -lines
+//        spectrum[i]->Draw("AL"); // A - axes, L -lines
 
-        sigma[i] = StandardDeviation(spectrum[i]);
-        EstimateBackground(arguments_ch, values_ch);
-        cout << "sigma ch " << i+1 << " = " << sigma[i] << endl;
+//        sigma[i] = StandardDeviation(spectrum[i]);
+        TGraph *bgGraph = EstimateBackground(arguments_ch, values_ch);
+        TF1* bgFit = new TF1("bgFit", "pol4", (Double_t)limits_ch.at(i).first, (Double_t)limits_ch.at(i).second);
+        bgGraph->Fit("bgFit");
+        bgGraph->Write("bgGraph");
 
-        minimumHeightDifference_ch[i] = noOfSigmaForConfInterval * sigma[i]; // różnica w wysokości max i min pochodnej
+        TGraph *peaksCandidatesGraph = FindPeaks(arguments_ch, values_ch, bgFit);
+        peaksCandidatesGraph->Write("peakGraph");
+
+        int noOfPeaks = peaksCandidatesGraph->GetN();
+        if (noOfPeaks > 0) {
+          TF1* peakFit = new TF1("peakFit", peakFunc, (Double_t)limits_ch.at(i).first, (Double_t)limits_ch.at(i).second, 8+2*noOfPeaks);
+          peakFit->SetParameter(0, bgFit->GetParameter(0));
+          peakFit->SetParameter(1, bgFit->GetParameter(1));
+          peakFit->SetParameter(2, bgFit->GetParameter(2));
+          peakFit->SetParameter(3, bgFit->GetParameter(3));
+          peakFit->SetParameter(4, bgFit->GetParameter(4));
+          peakFit->FixParameter(5, noOfPeaks);
+          peakFit->SetParameter(6, 0.1); // gamma
+          peakFit->SetParameter(7, 0.1); // sigma
+          double LargeIntens = 1E10;
+          for (unsigned j=0; j<noOfPeaks; j++) {
+            peakFit->SetParameter(8+j*2, peaksCandidatesGraph->GetPointY(j));
+            peakFit->SetParName(8+j*2, "Intensity");
+            peakFit->SetParLimits(8+j*2, 0, LargeIntens);
+
+            peakFit->SetParameter(9+j*2, peaksCandidatesGraph->GetPointX(j));
+            peakFit->SetParName(9+j*2, "Mean");
+            peakFit->SetParLimits(9+j*2, (Double_t)limits_ch.at(i).first, (Double_t)limits_ch.at(i).second);
+          }
+          cout << "Fitting " << noOfPeaks << " peak(s)" << endl;
+          spectrum->Fit(peakFit, "RM");
+          peakFit->SetNpx(1000000);
+          TCanvas* c1 = new TCanvas("c1", "c1", 800, 600);
+          spectrum->Draw("");
+          peakFit->Draw("same");
+          c1->Write("FittedSpectrum");
+          delete c1;
+        }
+//        cout << "sigma ch " << i+1 << " = " << sigma[i] << endl;
+
+//        minimumHeightDifference_ch[i] = noOfSigmaForConfInterval * sigma[i]; // różnica w wysokości max i min pochodnej
     }
+
+    outputFile->Close();
+    return 0;
 
     TH1F* derivative[6];
     TGraph* peaks[6];
@@ -448,12 +516,11 @@ double StandardDeviation(TGraph* spectrum_ch)
     return SmallestSigma;
 }
 
-void EstimateBackground(vector<double> arguments_ch, vector<double> values_ch)
+TGraph* EstimateBackground(vector<double> arguments_ch, vector<double> values_ch)
 {
 // Looking for local minima
   vector<int> minIndex;
   int minBinHalfRangeForMin = 5;
-  cout << "Arguments for min: ";
   for (int i=minBinHalfRangeForMin; i<arguments_ch.size()-minBinHalfRangeForMin; i++) {
     bool possibleMin = true;
     for (int j=1; j<=minBinHalfRangeForMin; j++) {
@@ -462,14 +529,11 @@ void EstimateBackground(vector<double> arguments_ch, vector<double> values_ch)
     }
     if (possibleMin) {
       minIndex.push_back(i);
-      cout << arguments_ch.at(i) << " ";
     }
   }
-  cout << endl;
 //
 // Looking for standard deviation around the local minima
   vector<double> sdAroundMin;
-  cout << "SD for min: ";
   for (int i=0; i<minIndex.size(); i++) {
     double mean = 0;
     for (int j=-minBinHalfRangeForMin; j<=minBinHalfRangeForMin; j++) {
@@ -480,9 +544,7 @@ void EstimateBackground(vector<double> arguments_ch, vector<double> values_ch)
       sd += std::pow(values_ch.at(minIndex.at(i)+j) - mean, 2)/(2*minBinHalfRangeForMin+1)/(2*minBinHalfRangeForMin);
     }
     sdAroundMin.push_back(sqrt(sd));
-    cout << sqrt(sd) << " ";
   }
-  cout << endl;
 //
 // Getting rid of sd too high and calculating mean SD
   vector<double> copyForMedian = sdAroundMin;
@@ -501,5 +563,97 @@ void EstimateBackground(vector<double> arguments_ch, vector<double> values_ch)
   }
   meanSD /= noOfNumberToMean;
   cout << "Median and meanSD: " << median << " " << meanSD << endl;
+  tempMeanSD = meanSD;
 //
+// Getting rid of minimal points that are coming from the peak defined as the difference between consecutive points greater than
+// discardConstant * meanSD
+  double discardConstant = 2.75;
+  double discardValue = discardConstant*meanSD;
+  vector<double> cleanerMinIndex;
+  double sthLowerThanTheLowestPoint = -1000;
+  double prevMin = sthLowerThanTheLowestPoint, prev2Min = sthLowerThanTheLowestPoint;
+  for (unsigned i=0; i<minIndexCropped.size(); i++) {
+    if (prevMin == sthLowerThanTheLowestPoint) {
+      if (i == minIndexCropped.size()-1)
+        break;
+      if (fabs(values_ch.at(minIndexCropped.at(i)) - values_ch.at(minIndexCropped.at(i+1))) <= discardValue) {
+// needs to be like that to cover the situation with random ultra low bins at the beginning
+        prevMin = values_ch.at(minIndexCropped.at(i));
+        cleanerMinIndex.push_back(minIndexCropped.at(i));
+      }
+    } else if (i<minIndexCropped.size()-1) {
+      if (values_ch.at(minIndexCropped.at(i)) <= prevMin + discardValue &&
+          values_ch.at(minIndexCropped.at(i)) <= values_ch.at(minIndexCropped.at(i+1)) + discardValue) {
+        prev2Min = prevMin;
+        prevMin = values_ch.at(minIndexCropped.at(i));
+        cleanerMinIndex.push_back(minIndexCropped.at(i));
+      } else if (prev2Min != sthLowerThanTheLowestPoint) {
+// covering situation with some random ultra low bins
+        if (values_ch.at(minIndexCropped.at(i)) <= prev2Min + discardValue &&
+            values_ch.at(minIndexCropped.at(i)) <= values_ch.at(minIndexCropped.at(i+1)) + discardValue) {
+          prev2Min = prevMin;
+          prevMin = values_ch.at(minIndexCropped.at(i));
+          cleanerMinIndex.push_back(minIndexCropped.at(i));
+        }
+      }
+    } else {
+      if (values_ch.at(minIndexCropped.at(i)) <= prevMin + discardValue) {
+        cleanerMinIndex.push_back(minIndexCropped.at(i));
+      }
+    }
+  }
+  cout << "Index size: raw - cropped - cleaned" << minIndex.size() << " - " << minIndexCropped.size() << " - " << cleanerMinIndex.size() << endl;
+//
+// Drawing and returning background
+  Double_t graphX[cleanerMinIndex.size()], graphY[cleanerMinIndex.size()];
+  for (unsigned i=0; i<cleanerMinIndex.size(); i++) {
+    graphX[i] = arguments_ch.at(cleanerMinIndex.at(i));
+    graphY[i] = values_ch.at(cleanerMinIndex.at(i));
+  }
+  return new TGraph(cleanerMinIndex.size(), graphX, graphY);
+}
+
+TGraph* FindPeaks(vector<double> arguments_ch, vector<double> values_ch, TF1* bgFit)
+{
+  vector<double> peakArg, peakVal;
+  double noiseRange = 12*tempMeanSD;
+  unsigned counter = 0;
+  unsigned minCounter = 2;
+  int minCounterForPeak = 7;
+  for (unsigned i=0; i<arguments_ch.size(); i++) {
+    if (values_ch.at(i) > bgFit->Eval(arguments_ch.at(i)) + noiseRange) {
+      counter++;
+    } else {
+      if (counter > minCounter) {
+        int noOfPotentialPeaks = floor(counter/(minCounterForPeak+1)) + 1;
+// minCounter + 1 to have a proper cut for multiple peaks
+        int skipBetweenPeaks = floor(counter/(noOfPotentialPeaks+1));
+        for (unsigned j=0; j<noOfPotentialPeaks; j++) {
+          int currIt = i - (j+1)*skipBetweenPeaks;
+          peakArg.push_back(arguments_ch.at(currIt));
+          peakVal.push_back(values_ch.at(currIt) - (bgFit->Eval(arguments_ch.at(currIt)) + noiseRange));
+        }
+      }
+      counter = 0;
+    }
+  }
+  if (peakArg.size() == 0)
+    return new TGraph();
+
+  return new TGraph(peakArg.size(), peakArg.data(), peakVal.data());
+}
+
+Double_t peakFunc(Double_t *A, Double_t *P)
+{
+  Double_t result = 0;
+  result += P[0] + P[1]*A[0] + P[2]*std::pow(A[0], 2) + P[3]*std::pow(A[0], 3) + P[4]*std::pow(A[0], 4);
+
+  Int_t noOfRandomVoigt = P[5];
+  Double_t gamma = P[6];
+  Double_t sigma = P[7];
+  for (unsigned i=0; i<noOfRandomVoigt; i++) {
+    result += P[8+2*i]*VoigtForPeak(A[0], P[9+2*i], sigma, gamma);
+  }
+
+  return result;
 }
